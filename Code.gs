@@ -5,43 +5,47 @@
    INSTRUCCIONES DE DESPLIEGUE:
    ============================
    1. Crear una hoja de Google con dos pestañas:
-      - "Users"     → Col A: Nombre, Col B: Email (fila 1 = encabezado, datos desde fila 2)
-      - "Calendars" → Col A: Calendar ID, Col B: Nombre corto, Col C: Color hex (#3B82F6)
+   
+      "Users" → Col A: Nombre, Col B: Email, Col C: PIN
+      (fila 1 = encabezado, datos desde fila 2)
+      Ejemplo:
+        | Nombre      | Email              | PIN  |
+        | Ana García  | ana@ejemplo.com    | 1234 |
+        | Pedro López | pedro@ejemplo.com  | 5678 |
+   
+      "Calendars" → Col A: Calendar ID, Col B: Nombre corto, Col C: Color hex
+      (fila 1 = encabezado, datos desde fila 2)
    
    2. Abrir Extensiones → Apps Script, pegar Code.gs e Index.html.
    
-   3. En el editor de Apps Script, ir a Configuración del proyecto (⚙️):
-      - Marcar "Mostrar archivo de manifiesto appsscript.json en el editor"
-      - Editar appsscript.json con los oauthScopes listados abajo.
-   
-   4. Implementar → Nueva implementación → Aplicación web:
-      - Ejecutar como: **Yo** (tu cuenta de Workspace)
-      - Quién tiene acceso: **Cualquier persona con cuenta de Google**
+   3. Implementar → Nueva implementación → Aplicación web:
+      - Ejecutar como: **Yo** (tu cuenta)
+      - Quién tiene acceso: **Cualquier persona**
       - Hacer clic en Implementar, autorizar cuando se solicite.
    
-   5. Compartir la URL de la aplicación web con los usuarios aprobados.
+   4. Compartir la URL de la aplicación web con los usuarios aprobados.
    
-   REQUIRED OAUTH SCOPES (add to appsscript.json):
-   ================================================
-   {
-     "timeZone": "Europe/London",
-     "dependencies": {},
-     "webapp": { "executeAs": "USER_DEPLOYING", "access": "ANYONE_LOGIN" },
-     "exceptionLogging": "STACKDRIVER",
-     "oauthScopes": [
-       "https://www.googleapis.com/auth/spreadsheets.readonly",
-       "https://www.googleapis.com/auth/calendar",
-       "https://www.googleapis.com/auth/calendar.events",
-       "https://www.googleapis.com/auth/userinfo.email",
-       "https://www.googleapis.com/auth/script.external_request"
-     ]
-   }
+   CÓMO FUNCIONA LA AUTENTICACIÓN:
+   ================================
+   - El script se ejecuta con TU cuenta → acceso a hojas y calendarios
+   - Los visitantes introducen su email + PIN (definido en la hoja Users)
+   - Se crea un token de sesión almacenado en CacheService (6 horas)
+   - Cada llamada al servidor incluye el token para verificar la sesión
+   - No se requiere OAuth ni permisos de Google para los visitantes
    ============================================================ */
+
+
+// ─────────────────────────────────────────────────────────────
+// 0. CONFIGURATION
+// ─────────────────────────────────────────────────────────────
+
+var SESSION_DURATION_SECONDS = 6 * 60 * 60; // 6 hours
 
 
 // ─────────────────────────────────────────────────────────────
 // 1. SERVE THE WEB APP
 // ─────────────────────────────────────────────────────────────
+
 function doGet(e) {
   return HtmlService.createTemplateFromFile('Index')
     .evaluate()
@@ -52,38 +56,49 @@ function doGet(e) {
 
 
 // ─────────────────────────────────────────────────────────────
-// 2. ROBUST EMAIL DETECTION
+// 2. SESSION MANAGEMENT
 // ─────────────────────────────────────────────────────────────
 
-function getUserEmail() {
-  var email = '';
-  try {
-    email = Session.getActiveUser().getEmail();
-  } catch (err) {
-    Logger.log('getActiveUser failed: ' + err);
+/**
+ * Generates a random session token.
+ */
+function generateToken_() {
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var token = '';
+  for (var i = 0; i < 48; i++) {
+    token += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  if (email) return email.toLowerCase().trim();
+  return token;
+}
 
-  try {
-    email = Session.getEffectiveUser().getEmail();
-  } catch (err) {
-    Logger.log('getEffectiveUser failed: ' + err);
-  }
-  if (email) return email.toLowerCase().trim();
+/**
+ * Stores a session: token → email mapping in ScriptCache.
+ */
+function createSession_(email) {
+  var token = generateToken_();
+  var cache = CacheService.getScriptCache();
+  cache.put('session_' + token, email, SESSION_DURATION_SECONDS);
+  return token;
+}
 
-  try {
-    var token = ScriptApp.getOAuthToken();
-    var resp = UrlFetchApp.fetch('https://www.googleapis.com/oauth2/v1/userinfo?alt=json', {
-      headers: { Authorization: 'Bearer ' + token },
-      muteHttpExceptions: true
-    });
-    var json = JSON.parse(resp.getContentText());
-    if (json.email) return json.email.toLowerCase().trim();
-  } catch (err) {
-    Logger.log('OAuth userinfo failed: ' + err);
-  }
+/**
+ * Validates a session token and returns the associated email.
+ * Returns empty string if invalid/expired.
+ */
+function getSessionEmail_(token) {
+  if (!token) return '';
+  var cache = CacheService.getScriptCache();
+  var email = cache.get('session_' + token);
+  return email || '';
+}
 
-  return '';
+/**
+ * Removes a session from cache.
+ */
+function destroySession_(token) {
+  if (!token) return;
+  var cache = CacheService.getScriptCache();
+  cache.remove('session_' + token);
 }
 
 
@@ -101,10 +116,10 @@ function getSpreadsheet() {
 
 /**
  * Reads the "Users" tab.
- * Expects: Col A = Name, Col B = Email (header in row 1, data from row 2).
- * Returns an array of { name: "...", email: "..." } objects.
+ * Expects: Col A = Name, Col B = Email, Col C = PIN
+ * (header in row 1, data from row 2).
  */
-function getApprovedUsers() {
+function getApprovedUsers_() {
   var ss = getSpreadsheet();
   var sheet = ss.getSheetByName('Users');
   if (!sheet) throw new Error('No se encontró la pestaña "Users".');
@@ -112,16 +127,26 @@ function getApprovedUsers() {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
 
-  var data = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+  var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
 
   return data
     .filter(function(row) { return row[1] && row[1].toString().trim() !== ''; })
     .map(function(row) {
       return {
         name:  row[0] ? row[0].toString().trim() : '',
-        email: row[1].toString().toLowerCase().trim()
+        email: row[1].toString().toLowerCase().trim(),
+        pin:   row[2] ? row[2].toString().trim() : ''
       };
     });
+}
+
+/**
+ * Returns user list WITHOUT pins (safe to send to client).
+ */
+function getApprovedUsersPublic_() {
+  return getApprovedUsers_().map(function(u) {
+    return { name: u.name, email: u.email };
+  });
 }
 
 /**
@@ -133,15 +158,9 @@ function getCalendarConfig() {
   if (!sheet) throw new Error('No se encontró la pestaña "Calendars".');
 
   var lastRow = sheet.getLastRow();
-  Logger.log('Calendars tab lastRow: ' + lastRow);
-
-  if (lastRow < 2) {
-    Logger.log('La pestaña Calendars no tiene filas de datos.');
-    return [];
-  }
+  if (lastRow < 2) return [];
 
   var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
-  Logger.log('Raw calendar data: ' + JSON.stringify(data));
 
   return data
     .filter(function(row) { return row[0] && row[0].toString().trim() !== ''; })
@@ -156,53 +175,116 @@ function getCalendarConfig() {
 
 
 // ─────────────────────────────────────────────────────────────
-// 4. MAIN DATA ENDPOINT
+// 4. LOGIN / LOGOUT
 // ─────────────────────────────────────────────────────────────
 
-function getAppData() {
-  var email = getUserEmail();
-  var userList = getApprovedUsers();
-
-  Logger.log('Detected email: "' + email + '"');
-  Logger.log('Approved users: ' + JSON.stringify(userList));
-
-  if (!email) {
-    return {
-      hasAccess: false,
-      email: '',
-      error: 'NO_EMAIL_DETECTED',
-      message: 'No se pudo detectar tu cuenta de Google. Asegúrate de haber iniciado sesión e inténtalo de nuevo.'
-    };
+/**
+ * Authenticates a user with email + PIN.
+ * Returns { success, token, email, userName, ... } or { success: false, message }.
+ */
+function login(email, pin) {
+  if (!email || !pin) {
+    return { success: false, message: 'Introduce tu email y PIN.' };
   }
 
-  var emailList = userList.map(function(u) { return u.email; });
-  if (emailList.indexOf(email) === -1) {
-    return {
-      hasAccess: false,
-      email: email,
-      error: 'NOT_APPROVED',
-      message: 'Tu email (' + email + ') no está en la lista de usuarios aprobados. Contacta al administrador.'
-    };
+  email = email.toLowerCase().trim();
+  pin = pin.toString().trim();
+
+  var users = getApprovedUsers_();
+  var match = users.find(function(u) { return u.email === email; });
+
+  if (!match) {
+    return { success: false, message: 'Email no encontrado en la lista de usuarios.' };
   }
 
-  var currentUser = userList.find(function(u) { return u.email === email; });
+  if (match.pin !== pin) {
+    return { success: false, message: 'PIN incorrecto.' };
+  }
+
+  var token = createSession_(email);
   var calendars = getCalendarConfig();
 
   return {
-    hasAccess: true,
-    email: email,
-    userName: currentUser ? currentUser.name : '',
-    users: userList,        // [{name, email}, ...] for role dropdowns
+    success:   true,
+    token:     token,
+    email:     email,
+    userName:  match.name,
+    users:     getApprovedUsersPublic_(),
     calendars: calendars
   };
 }
 
+/**
+ * Validates an existing session token and returns app data if valid.
+ */
+function resumeSession(token) {
+  var email = getSessionEmail_(token);
+  if (!email) {
+    return { success: false, message: 'Sesión expirada. Inicia sesión de nuevo.' };
+  }
+
+  var users = getApprovedUsers_();
+  var match = users.find(function(u) { return u.email === email; });
+
+  if (!match) {
+    destroySession_(token);
+    return { success: false, message: 'Tu cuenta ha sido eliminada de la lista de usuarios.' };
+  }
+
+  var calendars = getCalendarConfig();
+
+  return {
+    success:   true,
+    token:     token,
+    email:     email,
+    userName:  match.name,
+    users:     getApprovedUsersPublic_(),
+    calendars: calendars
+  };
+}
+
+/**
+ * Logs the user out.
+ */
+function logout(token) {
+  destroySession_(token);
+  return { success: true };
+}
+
 
 // ─────────────────────────────────────────────────────────────
-// 5. FETCH CALENDAR EVENTS
+// 5. ACCESS CHECK HELPER
 // ─────────────────────────────────────────────────────────────
 
-function getCalendarEvents(calendarId, startStr, endStr) {
+/**
+ * Validates a session token and ensures the user is still approved.
+ * Returns { email, userName } or throws.
+ */
+function requireSession_(token) {
+  var email = getSessionEmail_(token);
+  if (!email) {
+    throw new Error('SESSION_EXPIRED');
+  }
+
+  var users = getApprovedUsers_();
+  var match = users.find(function(u) { return u.email === email; });
+
+  if (!match) {
+    destroySession_(token);
+    throw new Error('SESSION_EXPIRED');
+  }
+
+  return { email: email, userName: match.name };
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// 6. FETCH CALENDAR EVENTS
+// ─────────────────────────────────────────────────────────────
+
+function getCalendarEvents(token, calendarId, startStr, endStr) {
+  requireSession_(token);
+
   var cal = CalendarApp.getCalendarById(calendarId);
   if (!cal) {
     throw new Error(
@@ -229,9 +311,7 @@ function getCalendarEvents(calendarId, startStr, endStr) {
           status: g.getGuestStatus().toString()
         };
       });
-    } catch (err) {
-      Logger.log('No se pudo obtener la lista de invitados: ' + err);
-    }
+    } catch (err) {}
 
     return {
       id:          e.getId(),
@@ -249,18 +329,20 @@ function getCalendarEvents(calendarId, startStr, endStr) {
 
 
 // ─────────────────────────────────────────────────────────────
-// 6. CREATE A BOOKING
+// 7. CREATE A BOOKING
 // ─────────────────────────────────────────────────────────────
 
-function createBooking(formObject) {
+function createBooking(token, formObject) {
+  var user = requireSession_(token);
+  var bookerEmail = user.email;
+
   if (!formObject.calendarId || !formObject.startTime || !formObject.duration || !formObject.title) {
-    throw new Error('Faltan campos obligatorios. Por favor completa calendario, hora, duración y título.');
+    throw new Error('Faltan campos obligatorios.');
   }
 
   var cal = CalendarApp.getCalendarById(formObject.calendarId);
   if (!cal) throw new Error('Calendario no encontrado o acceso denegado.');
 
-  var bookerEmail = getUserEmail();
   var startTime = new Date(formObject.startTime);
   var durationMinutes = parseInt(formObject.duration, 10);
 
@@ -328,17 +410,15 @@ function createBooking(formObject) {
 
 
 // ─────────────────────────────────────────────────────────────
-// 7. DEBUG / TEST HELPERS
+// 8. DEBUG HELPERS
 // ─────────────────────────────────────────────────────────────
 
-function debugAuth() {
-  Logger.log('=== AUTH DEBUG ===');
-  Logger.log('getActiveUser:    "' + Session.getActiveUser().getEmail() + '"');
-  Logger.log('getEffectiveUser: "' + Session.getEffectiveUser().getEmail() + '"');
-  Logger.log('getUserEmail():   "' + getUserEmail() + '"');
-  Logger.log('');
+function debugConfig() {
   Logger.log('=== USUARIOS APROBADOS ===');
-  Logger.log(JSON.stringify(getApprovedUsers()));
+  var users = getApprovedUsers_();
+  users.forEach(function(u) {
+    Logger.log('  ' + u.name + ' | ' + u.email + ' | PIN: ' + (u.pin ? '****' : 'NO PIN'));
+  });
   Logger.log('');
   Logger.log('=== CALENDARIOS ===');
   Logger.log(JSON.stringify(getCalendarConfig()));
@@ -348,29 +428,6 @@ function debugCalendarAccess() {
   var calendars = getCalendarConfig();
   calendars.forEach(function(c) {
     var cal = CalendarApp.getCalendarById(c.id);
-    if (cal) {
-      Logger.log('✓ Acceso OK: ' + c.name + ' (' + c.id + ')');
-    } else {
-      Logger.log('✗ SIN ACCESO: ' + c.name + ' (' + c.id + ')');
-    }
+    Logger.log((cal ? '✓' : '✗') + ' ' + c.name + ' (' + c.id + ')');
   });
-}
-
-function debugCalendarsTab() {
-  var ss = getSpreadsheet();
-  var sheet = ss.getSheetByName('Calendars');
-  if (!sheet) { Logger.log('ERROR: No se encontró pestaña "Calendars"'); return; }
-
-  Logger.log('Sheet name: ' + sheet.getName());
-  Logger.log('getLastRow(): ' + sheet.getLastRow());
-  Logger.log('getLastColumn(): ' + sheet.getLastColumn());
-
-  var range = sheet.getRange(1, 1, Math.min(sheet.getMaxRows(), 10), 3);
-  var values = range.getValues();
-  values.forEach(function(row, i) {
-    Logger.log('Row ' + (i + 1) + ': A="' + row[0] + '" | B="' + row[1] + '" | C="' + row[2] + '"');
-  });
-
-  var result = getCalendarConfig();
-  Logger.log('getCalendarConfig() returned: ' + JSON.stringify(result));
 }
