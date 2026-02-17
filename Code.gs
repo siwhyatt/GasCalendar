@@ -28,6 +28,7 @@
    CÓMO FUNCIONA LA AUTENTICACIÓN:
    ================================
    - El script se ejecuta con TU cuenta → acceso a hojas y calendarios
+   - access: "ANYONE" → no se requiere inicio de sesión con Google
    - Los visitantes introducen su email + PIN (definido en la hoja Users)
    - Se crea un token de sesión almacenado en CacheService (6 horas)
    - Cada llamada al servidor incluye el token para verificar la sesión
@@ -59,9 +60,6 @@ function doGet(e) {
 // 2. SESSION MANAGEMENT
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Generates a random session token.
- */
 function generateToken_() {
   var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   var token = '';
@@ -71,9 +69,6 @@ function generateToken_() {
   return token;
 }
 
-/**
- * Stores a session: token → email mapping in ScriptCache.
- */
 function createSession_(email) {
   var token = generateToken_();
   var cache = CacheService.getScriptCache();
@@ -81,10 +76,6 @@ function createSession_(email) {
   return token;
 }
 
-/**
- * Validates a session token and returns the associated email.
- * Returns empty string if invalid/expired.
- */
 function getSessionEmail_(token) {
   if (!token) return '';
   var cache = CacheService.getScriptCache();
@@ -92,9 +83,6 @@ function getSessionEmail_(token) {
   return email || '';
 }
 
-/**
- * Removes a session from cache.
- */
 function destroySession_(token) {
   if (!token) return;
   var cache = CacheService.getScriptCache();
@@ -117,7 +105,6 @@ function getSpreadsheet() {
 /**
  * Reads the "Users" tab.
  * Expects: Col A = Name, Col B = Email, Col C = PIN
- * (header in row 1, data from row 2).
  */
 function getApprovedUsers_() {
   var ss = getSpreadsheet();
@@ -178,10 +165,6 @@ function getCalendarConfig() {
 // 4. LOGIN / LOGOUT
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Authenticates a user with email + PIN.
- * Returns { success, token, email, userName, ... } or { success: false, message }.
- */
 function login(email, pin) {
   if (!email || !pin) {
     return { success: false, message: 'Introduce tu email y PIN.' };
@@ -214,9 +197,6 @@ function login(email, pin) {
   };
 }
 
-/**
- * Validates an existing session token and returns app data if valid.
- */
 function resumeSession(token) {
   var email = getSessionEmail_(token);
   if (!email) {
@@ -243,9 +223,6 @@ function resumeSession(token) {
   };
 }
 
-/**
- * Logs the user out.
- */
 function logout(token) {
   destroySession_(token);
   return { success: true };
@@ -256,10 +233,6 @@ function logout(token) {
 // 5. ACCESS CHECK HELPER
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Validates a session token and ensures the user is still approved.
- * Returns { email, userName } or throws.
- */
 function requireSession_(token) {
   var email = getSessionEmail_(token);
   if (!email) {
@@ -352,6 +325,7 @@ function createBooking(token, formObject) {
 
   var endTime = new Date(startTime.getTime() + durationMinutes * 60000);
 
+  // Check for conflicts
   var conflicts = cal.getEvents(startTime, endTime);
   if (conflicts.length > 0) {
     throw new Error(
@@ -361,6 +335,7 @@ function createBooking(token, formObject) {
     );
   }
 
+  // Build guest list (deduplicated)
   var guestSet = {};
   function addGuest(email) {
     if (email && email.indexOf('@') !== -1) {
