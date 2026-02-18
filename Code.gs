@@ -1,52 +1,35 @@
 /* ============================================================
-   Code.gs — Aplicación de Reservas de Calendario (Google Apps Script)
+   Code.gs — Aplicación de Reservas (Google Apps Script)
    ============================================================
-   
-   INSTRUCCIONES DE DESPLIEGUE:
-   ============================
-   1. Crear una hoja de Google con dos pestañas:
-   
-      "Users" → Col A: Nombre, Col B: Email, Col C: PIN
-      (fila 1 = encabezado, datos desde fila 2)
-      Ejemplo:
-        | Nombre      | Email              | PIN  |
-        | Ana García  | ana@ejemplo.com    | 1234 |
-        | Pedro López | pedro@ejemplo.com  | 5678 |
-   
-      "Calendars" → Col A: Calendar ID, Col B: Nombre corto, Col C: Color hex
-      (fila 1 = encabezado, datos desde fila 2)
-   
-   2. Abrir Extensiones → Apps Script, pegar Code.gs e Index.html.
-   
-   3. Implementar → Nueva implementación → Aplicación web:
-      - Ejecutar como: **Yo** (tu cuenta)
-      - Quién tiene acceso: **Cualquier persona**
-      - Hacer clic en Implementar, autorizar cuando se solicite.
-   
-   4. Compartir la URL de la aplicación web con los usuarios aprobados.
-   
-   CÓMO FUNCIONA LA AUTENTICACIÓN:
-   ================================
-   - El script se ejecuta con TU cuenta → acceso a hojas y calendarios
-   - access: "ANYONE" → no se requiere inicio de sesión con Google
-   - Los visitantes introducen su email + PIN (definido en la hoja Users)
-   - Se crea un token de sesión almacenado en CacheService (6 horas)
-   - Cada llamada al servidor incluye el token para verificar la sesión
-   - No se requiere OAuth ni permisos de Google para los visitantes
+
+   CONFIGURACIÓN DE LA HOJA:
+   ─────────────────────────
+   Pestaña "Users":
+     Col A = Nombre
+     Col B = Email
+     Col C = PIN (numérico, ej. 1234)
+     Fila 1 = encabezado, datos desde fila 2
+
+   Pestaña "Calendars":
+     Col A = Calendar ID
+     Col B = Nombre de la sala
+     Col C = Color hex (ej. #3B82F6)
+     Col D = Centro (ej. "El Poblet" o "La Sala")
+     Col E = Grupo de combinación ("1" para salas combinables, vacío si no)
+     Col F = URL de Google Maps (ej. https://maps.app.goo.gl/...)
+     Fila 1 = encabezado, datos desde fila 2
+
+   DESPLIEGUE:
+   ───────────
+   Implementar → Nueva implementación → Aplicación web
+     - Ejecutar como: Yo
+     - Acceso: Cualquier persona
    ============================================================ */
-
-
-// ─────────────────────────────────────────────────────────────
-// 0. CONFIGURATION
-// ─────────────────────────────────────────────────────────────
-
-var SESSION_DURATION_SECONDS = 6 * 60 * 60; // 6 hours
 
 
 // ─────────────────────────────────────────────────────────────
 // 1. SERVE THE WEB APP
 // ─────────────────────────────────────────────────────────────
-
 function doGet(e) {
   return HtmlService.createTemplateFromFile('Index')
     .evaluate()
@@ -57,43 +40,40 @@ function doGet(e) {
 
 
 // ─────────────────────────────────────────────────────────────
-// 2. SESSION MANAGEMENT
+// 2. SESSION MANAGEMENT (CacheService — no OAuth needed)
 // ─────────────────────────────────────────────────────────────
+var SESSION_TTL = 21600; // 6 hours
 
-function generateToken_() {
+function generateToken() {
   var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  var token = '';
-  for (var i = 0; i < 48; i++) {
-    token += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return token;
+  var t = '';
+  for (var i = 0; i < 48; i++) t += chars.charAt(Math.floor(Math.random() * chars.length));
+  return t;
 }
 
-function createSession_(email) {
-  var token = generateToken_();
-  var cache = CacheService.getScriptCache();
-  cache.put('session_' + token, email, SESSION_DURATION_SECONDS);
-  return token;
+function saveSession(token, email) {
+  CacheService.getScriptCache().put('sess_' + token, email, SESSION_TTL);
 }
 
-function getSessionEmail_(token) {
-  if (!token) return '';
-  var cache = CacheService.getScriptCache();
-  var email = cache.get('session_' + token);
-  return email || '';
+function getSessionEmail(token) {
+  if (!token) return null;
+  return CacheService.getScriptCache().get('sess_' + token) || null;
 }
 
-function destroySession_(token) {
-  if (!token) return;
-  var cache = CacheService.getScriptCache();
-  cache.remove('session_' + token);
+function deleteSession(token) {
+  if (token) CacheService.getScriptCache().remove('sess_' + token);
+}
+
+function requireAuth(token) {
+  var email = getSessionEmail(token);
+  if (!email) throw new Error('SESSION_EXPIRED');
+  return email;
 }
 
 
 // ─────────────────────────────────────────────────────────────
 // 3. SPREADSHEET HELPERS
 // ─────────────────────────────────────────────────────────────
-
 function getSpreadsheet() {
   try {
     return SpreadsheetApp.getActiveSpreadsheet();
@@ -102,307 +82,253 @@ function getSpreadsheet() {
   }
 }
 
-/**
- * Reads the "Users" tab.
- * Expects: Col A = Name, Col B = Email, Col C = PIN
- */
-function getApprovedUsers_() {
-  var ss = getSpreadsheet();
-  var sheet = ss.getSheetByName('Users');
+/** Users tab: A=Name, B=Email, C=PIN */
+function getUsers() {
+  var sheet = getSpreadsheet().getSheetByName('Users');
   if (!sheet) throw new Error('No se encontró la pestaña "Users".');
-
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
-
-  var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
-
-  return data
-    .filter(function(row) { return row[1] && row[1].toString().trim() !== ''; })
-    .map(function(row) {
+  return sheet.getRange(2, 1, lastRow - 1, 3).getValues()
+    .filter(function(r) { return r[1] && r[1].toString().trim(); })
+    .map(function(r) {
       return {
-        name:  row[0] ? row[0].toString().trim() : '',
-        email: row[1].toString().toLowerCase().trim(),
-        pin:   row[2] ? row[2].toString().trim() : ''
+        name:  r[0] ? r[0].toString().trim() : '',
+        email: r[1].toString().toLowerCase().trim(),
+        pin:   r[2] ? r[2].toString().trim() : ''
       };
     });
 }
 
-/**
- * Returns user list WITHOUT pins (safe to send to client).
- */
-function getApprovedUsersPublic_() {
-  return getApprovedUsers_().map(function(u) {
-    return { name: u.name, email: u.email };
-  });
-}
-
-/**
- * Reads the "Calendars" tab and returns an array of {id, name, color}.
- */
+/** Calendars tab: A=ID, B=Name, C=Color, D=Centre, E=PairGroup */
 function getCalendarConfig() {
-  var ss = getSpreadsheet();
-  var sheet = ss.getSheetByName('Calendars');
+  var sheet = getSpreadsheet().getSheetByName('Calendars');
   if (!sheet) throw new Error('No se encontró la pestaña "Calendars".');
-
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
-
-  var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
-
-  return data
-    .filter(function(row) { return row[0] && row[0].toString().trim() !== ''; })
-    .map(function(row) {
+  return sheet.getRange(2, 1, lastRow - 1, 6).getValues()
+    .filter(function(r) { return r[0] && r[0].toString().trim(); })
+    .map(function(r) {
       return {
-        id:    row[0].toString().trim(),
-        name:  row[1] ? row[1].toString().trim() : 'Calendario sin nombre',
-        color: (row[2] ? row[2].toString().trim() : '') || '#3B82F6'
+        id:        r[0].toString().trim(),
+        name:      r[1] ? r[1].toString().trim() : 'Sala sin nombre',
+        color:     (r[2] ? r[2].toString().trim() : '') || '#3B82F6',
+        centre:    r[3] ? r[3].toString().trim() : '',
+        pairGroup: r[4] ? r[4].toString().trim() : '',
+        mapsUrl:   r[5] ? r[5].toString().trim() : ''
       };
     });
+}
+
+function getDistinctCentres(calendars) {
+  var seen = {}, out = [];
+  calendars.forEach(function(c) {
+    if (c.centre && !seen[c.centre]) { seen[c.centre] = true; out.push(c.centre); }
+  });
+  return out;
 }
 
 
 // ─────────────────────────────────────────────────────────────
-// 4. LOGIN / LOGOUT
+// 4. AUTH ENDPOINTS
 // ─────────────────────────────────────────────────────────────
 
 function login(email, pin) {
-  if (!email || !pin) {
-    return { success: false, message: 'Introduce tu email y PIN.' };
+  try {
+    email = email.toLowerCase().trim();
+    pin   = pin.toString().trim();
+
+    var users = getUsers();
+    var user  = users.find(function(u) { return u.email === email; });
+
+    if (!user)     return { success: false, message: 'Email no reconocido. Contacta al administrador.' };
+    if (!user.pin) return { success: false, message: 'Sin PIN asignado. Contacta al administrador.' };
+    if (user.pin !== pin) return { success: false, message: 'PIN incorrecto. Inténtalo de nuevo.' };
+
+    var token     = generateToken();
+    saveSession(token, email);
+
+    var calendars = getCalendarConfig();
+    var safeUsers = users.map(function(u) { return { name: u.name, email: u.email }; });
+
+    return {
+      success:   true,
+      token:     token,
+      email:     email,
+      userName:  user.name,
+      users:     safeUsers,
+      calendars: calendars,
+      centres:   getDistinctCentres(calendars)
+    };
+  } catch (err) {
+    Logger.log('login error: ' + err);
+    return { success: false, message: 'Error del servidor: ' + err.message };
   }
-
-  email = email.toLowerCase().trim();
-  pin = pin.toString().trim();
-
-  var users = getApprovedUsers_();
-  var match = users.find(function(u) { return u.email === email; });
-
-  if (!match) {
-    return { success: false, message: 'Email no encontrado en la lista de usuarios.' };
-  }
-
-  if (match.pin !== pin) {
-    return { success: false, message: 'PIN incorrecto.' };
-  }
-
-  var token = createSession_(email);
-  var calendars = getCalendarConfig();
-
-  return {
-    success:   true,
-    token:     token,
-    email:     email,
-    userName:  match.name,
-    users:     getApprovedUsersPublic_(),
-    calendars: calendars
-  };
 }
 
 function resumeSession(token) {
-  var email = getSessionEmail_(token);
-  if (!email) {
-    return { success: false, message: 'Sesión expirada. Inicia sesión de nuevo.' };
+  try {
+    var email = getSessionEmail(token);
+    if (!email) return { success: false };
+
+    var users = getUsers();
+    var user  = users.find(function(u) { return u.email === email; });
+    if (!user) return { success: false };
+
+    var calendars = getCalendarConfig();
+    var safeUsers = users.map(function(u) { return { name: u.name, email: u.email }; });
+
+    return {
+      success:   true,
+      token:     token,
+      email:     email,
+      userName:  user.name,
+      users:     safeUsers,
+      calendars: calendars,
+      centres:   getDistinctCentres(calendars)
+    };
+  } catch (err) {
+    return { success: false };
   }
-
-  var users = getApprovedUsers_();
-  var match = users.find(function(u) { return u.email === email; });
-
-  if (!match) {
-    destroySession_(token);
-    return { success: false, message: 'Tu cuenta ha sido eliminada de la lista de usuarios.' };
-  }
-
-  var calendars = getCalendarConfig();
-
-  return {
-    success:   true,
-    token:     token,
-    email:     email,
-    userName:  match.name,
-    users:     getApprovedUsersPublic_(),
-    calendars: calendars
-  };
 }
 
 function logout(token) {
-  destroySession_(token);
-  return { success: true };
+  deleteSession(token);
 }
 
 
 // ─────────────────────────────────────────────────────────────
-// 5. ACCESS CHECK HELPER
-// ─────────────────────────────────────────────────────────────
-
-function requireSession_(token) {
-  var email = getSessionEmail_(token);
-  if (!email) {
-    throw new Error('SESSION_EXPIRED');
-  }
-
-  var users = getApprovedUsers_();
-  var match = users.find(function(u) { return u.email === email; });
-
-  if (!match) {
-    destroySession_(token);
-    throw new Error('SESSION_EXPIRED');
-  }
-
-  return { email: email, userName: match.name };
-}
-
-
-// ─────────────────────────────────────────────────────────────
-// 6. FETCH CALENDAR EVENTS
+// 5. FETCH CALENDAR EVENTS
 // ─────────────────────────────────────────────────────────────
 
 function getCalendarEvents(token, calendarId, startStr, endStr) {
-  requireSession_(token);
-
+  requireAuth(token);
   var cal = CalendarApp.getCalendarById(calendarId);
-  if (!cal) {
-    throw new Error(
-      'Calendario no encontrado o acceso denegado para ID: ' + calendarId +
-      '. Asegúrate de que el calendario esté compartido con la cuenta del propietario del script.'
-    );
-  }
+  if (!cal) throw new Error('Calendario no encontrado: ' + calendarId);
 
-  var start = new Date(startStr);
-  var end   = new Date(endStr);
-  var events = cal.getEvents(start, end);
-
-  return events.map(function(e) {
-    var isRecurring = false;
-    try { isRecurring = e.isRecurringEvent(); } catch (err) {}
-
-    var guestList = [];
+  return cal.getEvents(new Date(startStr), new Date(endStr)).map(function(e) {
+    var isRec = false;
+    try { isRec = e.isRecurringEvent(); } catch (x) {}
+    var guests = [];
     try {
-      var guests = e.getGuestList(true);
-      guestList = guests.map(function(g) {
-        return {
-          email: g.getEmail(),
-          name:  g.getName() || g.getEmail(),
-          status: g.getGuestStatus().toString()
-        };
+      guests = e.getGuestList(true).map(function(g) {
+        return { email: g.getEmail(), name: g.getName() || g.getEmail(), status: g.getGuestStatus().toString() };
       });
-    } catch (err) {}
-
+    } catch (x) {}
     return {
-      id:          e.getId(),
-      title:       e.getTitle() + (isRecurring ? ' 🔁' : ''),
-      start:       e.getStartTime().toISOString(),
-      end:         e.getEndTime().toISOString(),
-      description: e.getDescription() || '',
-      guests:      guestList,
-      isRecurring: isRecurring,
-      color:       isRecurring ? '#9CA3AF' : null,
-      location:    e.getLocation() || ''
+      id: e.getId(), title: e.getTitle(),
+      start: e.getStartTime().toISOString(), end: e.getEndTime().toISOString(),
+      description: e.getDescription() || '', location: e.getLocation() || '',
+      guests: guests, isRecurring: isRec, color: isRec ? '#9CA3AF' : null
     };
   });
 }
 
+function getMultiCalendarEvents(token, calendarIds, startStr, endStr) {
+  requireAuth(token);
+  var all = [];
+  calendarIds.forEach(function(calId) {
+    try {
+      var cal = CalendarApp.getCalendarById(calId);
+      if (!cal) return;
+      cal.getEvents(new Date(startStr), new Date(endStr)).forEach(function(e) {
+        var isRec = false;
+        try { isRec = e.isRecurringEvent(); } catch (x) {}
+        all.push({
+          id: e.getId(), title: e.getTitle(),
+          start: e.getStartTime().toISOString(), end: e.getEndTime().toISOString(),
+          description: e.getDescription() || '', location: e.getLocation() || '',
+          guests: [], isRecurring: isRec, color: isRec ? '#9CA3AF' : null,
+          sourceCalendarId: calId
+        });
+      });
+    } catch (err) { Logger.log('Error fetching ' + calId + ': ' + err); }
+  });
+  all.sort(function(a, b) { return new Date(a.start) - new Date(b.start); });
+  return all;
+}
+
 
 // ─────────────────────────────────────────────────────────────
-// 7. CREATE A BOOKING
+// 6. CREATE BOOKING
 // ─────────────────────────────────────────────────────────────
 
 function createBooking(token, formObject) {
-  var user = requireSession_(token);
-  var bookerEmail = user.email;
+  var bookerEmail = requireAuth(token);
 
-  if (!formObject.calendarId || !formObject.startTime || !formObject.duration || !formObject.title) {
+  if (!formObject.calendarIds || !formObject.startTime || !formObject.duration || !formObject.title) {
     throw new Error('Faltan campos obligatorios.');
   }
 
-  var cal = CalendarApp.getCalendarById(formObject.calendarId);
-  if (!cal) throw new Error('Calendario no encontrado o acceso denegado.');
-
   var startTime = new Date(formObject.startTime);
-  var durationMinutes = parseInt(formObject.duration, 10);
+  var duration  = parseInt(formObject.duration, 10);
+  if (isNaN(duration) || duration <= 0) throw new Error('Duración no válida.');
+  var endTime = new Date(startTime.getTime() + duration * 60000);
 
-  if (isNaN(durationMinutes) || durationMinutes <= 0) {
-    throw new Error('Duración no válida.');
-  }
+  var cals = formObject.calendarIds.map(function(id) {
+    var cal = CalendarApp.getCalendarById(id);
+    if (!cal) throw new Error('Calendario no encontrado: ' + id);
+    return cal;
+  });
 
-  var endTime = new Date(startTime.getTime() + durationMinutes * 60000);
+  // Conflict check
+  var conflicts = [];
+  cals.forEach(function(cal) {
+    var ex = cal.getEvents(startTime, endTime);
+    if (ex.length) conflicts.push(cal.getName() + ': "' + ex[0].getTitle() + '"');
+  });
+  if (conflicts.length) throw new Error('¡Conflicto de horario!\n' + conflicts.join('\n'));
 
-  // Check for conflicts
-  var conflicts = cal.getEvents(startTime, endTime);
-  if (conflicts.length > 0) {
-    throw new Error(
-      '¡Conflicto de horario! Ya existe un evento de ' +
-      conflicts[0].getStartTime().toLocaleTimeString() + ' a ' +
-      conflicts[0].getEndTime().toLocaleTimeString() + '. Elige otro horario.'
-    );
-  }
+  // Guests
+  var gs = {};
+  [bookerEmail, formObject.organiser, formObject.responsible, formObject.open, formObject.close]
+    .forEach(function(em) { if (em && em.indexOf('@') !== -1) gs[em.toLowerCase().trim()] = true; });
 
-  // Build guest list (deduplicated)
-  var guestSet = {};
-  function addGuest(email) {
-    if (email && email.indexOf('@') !== -1) {
-      guestSet[email.toLowerCase().trim()] = true;
-    }
-  }
-
-  addGuest(bookerEmail);
-  addGuest(formObject.organiser);
-  addGuest(formObject.responsible);
-  addGuest(formObject.open);
-  addGuest(formObject.close);
-
-  var guestString = Object.keys(guestSet).join(',');
-
-  var roleBlock = [
+  // Description
+  var roles = [
     '────────────────────────',
     'ROLES:',
-    '  Organizador:  ' + (formObject.organiser    || '—'),
-    '  Responsable:  ' + (formObject.responsible   || '—'),
-    '  Apertura:     ' + (formObject.open          || '—'),
-    '  Cierre:       ' + (formObject.close         || '—'),
+    '  Organizador:  ' + (formObject.organiser  || '–'),
+    '  Tel. Organiz: ' + (formObject.phone       || '–'),
+    '  Responsable:  ' + (formObject.responsible || '–'),
+    '  Apertura:     ' + (formObject.open        || '–'),
+    '  Cierre:       ' + (formObject.close       || '–'),
     '────────────────────────',
     'Reservado por: ' + bookerEmail
   ].join('\n');
 
-  var fullDescription = '';
-  if (formObject.description && formObject.description.trim()) {
-    fullDescription = formObject.description.trim() + '\n\n' + roleBlock;
-  } else {
-    fullDescription = roleBlock;
-  }
+  var desc = formObject.description
+    ? formObject.description.trim() + '\n\n' + roles
+    : roles;
 
-  var event = cal.createEvent(formObject.title, startTime, endTime, {
-    description: fullDescription,
-    guests:      guestString,
-    sendInvites: true
+  var ids = cals.map(function(cal) {
+    return cal.createEvent(formObject.title, startTime, endTime, {
+      description: desc,
+      guests:      Object.keys(gs).join(','),
+      sendInvites: true,
+      location:    formObject.location || ''
+    }).getId();
   });
 
   return {
-    status: 'success',
-    eventId: event.getId(),
-    message: 'Reserva confirmada para ' + startTime.toLocaleDateString('es-ES') +
-             ' a las ' + startTime.toLocaleTimeString('es-ES', {hour: '2-digit', minute:'2-digit'})
+    status:   'success',
+    eventIds: ids,
+    message:  'Reserva confirmada para ' +
+              startTime.toLocaleDateString('es-ES') + ' a las ' +
+              startTime.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })
   };
 }
 
 
 // ─────────────────────────────────────────────────────────────
-// 8. DEBUG HELPERS
+// 7. DEBUG HELPERS
 // ─────────────────────────────────────────────────────────────
-
-function debugConfig() {
-  Logger.log('=== USUARIOS APROBADOS ===');
-  var users = getApprovedUsers_();
-  users.forEach(function(u) {
-    Logger.log('  ' + u.name + ' | ' + u.email + ' | PIN: ' + (u.pin ? '****' : 'NO PIN'));
-  });
-  Logger.log('');
-  Logger.log('=== CALENDARIOS ===');
-  Logger.log(JSON.stringify(getCalendarConfig()));
+function debugSheet() {
+  Logger.log('USERS: ' + JSON.stringify(getUsers()));
+  Logger.log('CALENDARS: ' + JSON.stringify(getCalendarConfig()));
 }
-
 function debugCalendarAccess() {
-  var calendars = getCalendarConfig();
-  calendars.forEach(function(c) {
+  getCalendarConfig().forEach(function(c) {
     var cal = CalendarApp.getCalendarById(c.id);
-    Logger.log((cal ? '✓' : '✗') + ' ' + c.name + ' (' + c.id + ')');
+    Logger.log((cal ? '✔' : '✗') + ' ' + c.name + ' [' + c.centre + '] ' + c.id);
   });
 }
