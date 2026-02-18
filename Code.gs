@@ -137,12 +137,31 @@ function login(email, pin) {
     email = email.toLowerCase().trim();
     pin   = pin.toString().trim();
 
+    // ── Rate limiting: max 5 failed attempts per email per 15 minutes ──
+    var cache        = CacheService.getScriptCache();
+    var rateLimitKey = 'rl_' + email.replace(/[^a-z0-9]/g, '_');
+    var attempts     = parseInt(cache.get(rateLimitKey) || '0', 10);
+    var LOCK_AFTER   = 5;
+    var LOCK_SECS    = 900; // 15 minutes
+    if (attempts >= LOCK_AFTER) {
+      return { success: false, message: 'Demasiados intentos fallidos. Inténtalo de nuevo en 15 minutos.' };
+    }
+    // ── End rate limiting check ──
+
     var users = getUsers();
     var user  = users.find(function(u) { return u.email === email; });
 
     if (!user)     return { success: false, message: 'Email no reconocido. Contacta al administrador.' };
     if (!user.pin) return { success: false, message: 'Sin PIN asignado. Contacta al administrador.' };
-    if (user.pin !== pin) return { success: false, message: 'PIN incorrecto. Inténtalo de nuevo.' };
+    if (user.pin !== pin) {
+      // Increment failed attempt counter
+      cache.put(rateLimitKey, (attempts + 1).toString(), LOCK_SECS);
+      var remaining = LOCK_AFTER - attempts - 1;
+      return { success: false, message: 'PIN incorrecto. Inténtalo de nuevo.' + (remaining <= 2 ? ' (' + remaining + ' intentos restantes)' : '') };
+    }
+
+    // Successful login — clear the rate limit counter
+    cache.remove(rateLimitKey);
 
     var token     = generateToken();
     saveSession(token, email);
@@ -260,6 +279,7 @@ function createBooking(token, formObject) {
   }
 
   var startTime = new Date(formObject.startTime);
+  if (startTime < new Date()) throw new Error('No se pueden crear reservas en el pasado.');
   var duration  = parseInt(formObject.duration, 10);
   if (isNaN(duration) || duration <= 0) throw new Error('Duración no válida.');
   var endTime = new Date(startTime.getTime() + duration * 60000);

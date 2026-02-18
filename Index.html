@@ -858,7 +858,12 @@ function jumpToDate(val) {
 var bookingSlotTime = null;
 
 function onSlotClick(el) {
-  bookingSlotTime = new Date(el.getAttribute('data-time'));
+  var slotTime = new Date(el.getAttribute('data-time'));
+  if (slotTime < new Date()) {
+    alert('No se pueden crear reservas en el pasado.');
+    return;
+  }
+  bookingSlotTime = slotTime;
   openBookingModal();
 }
 
